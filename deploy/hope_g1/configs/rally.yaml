@@ -1,0 +1,43 @@
+# This task has 22 saved motions (0..21), independent of mjlab's library.
+ready_seconds: 0.0
+return_blend_seconds: 0.0
+max_intercept_distance: 0.25
+max_start_frame: 29
+selection_hysteresis: 0.05
+viewer:
+  lookat: [1.2, 0.0, 0.9]
+  distance: 4.6
+  elevation: -20.0
+  azimuth: 125.0
+feed:
+  speed_range: [2.0, 2.5]
+  lateral_speed_range: [-0.1, 0.1]
+  intercept_jitter: [0.008, 0.008, 0.004]
+  interval_seconds: 4.0
+ball:
+  # Prediction/physical ball settings, not actor observations.
+  racket_body_name: right_wrist_yaw_link
+  racket_offset: [0.215, 0.003, 0.0]
+  racket_normal_axis: 1
+  racket_radius: 0.08
+  ball_radius: 0.02
+  racket_restitution: 0.85
+  table_restitution: 0.88
+  table_near_x: 0.65
+  table_far_x: 3.39
+  table_width: 1.525
+  table_height: 0.76
+  net_height: 0.1525
+  gravity: 9.81
+  drag: 0.0
+  strike_phase: 0.46
+  minimum_intercept_time: 0.35
+  arrival_time_jitter: 0.0
+  flight_time_range: [0.4, 0.5]
+  incoming_speed_range: [2.0, 2.5]
+  incoming_lateral_speed_range: [-0.1, 0.1]
+  incoming_vertical_speed: -2.7
+  intercept_jitter: [0.008, 0.008, 0.004]
+  target_xy: [2.70, 0.0]
+  target_jitter: [0.15, 0.20]
+  max_ball_time: 3.0
