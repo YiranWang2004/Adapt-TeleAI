@@ -14,6 +14,8 @@ import numpy as np
 import yaml
 
 from deploy.backends.mujoco import MujocoBackend
+from deploy.backends.playback import HELP as PLAYBACK_HELP
+from deploy.backends.playback import PlaybackControl
 from deploy.g1_pingpong.commands import CommandGuard, policy_pd_settings
 from deploy.g1_pingpong.core import rotation
 from deploy.g1_pingpong.feeder import RandomBallFeeder
@@ -143,7 +145,8 @@ def run_rally(
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     stream = (output / "trace.jsonl").open("w")
-  wall_start = time.monotonic()
+  playback = PlaybackControl()
+  playback.reset(0.)
   dt = cfg["control_dt"]
   now = 0.0
   try:
@@ -152,7 +155,8 @@ def run_rally(
     if render:
       from mujoco import viewer as mujoco_viewer
 
-      viewer = mujoco_viewer.launch_passive(robot.model, robot.data)
+      viewer = mujoco_viewer.launch_passive(robot.model, robot.data, key_callback=playback.key)
+      print(f"MuJoCo playback: {PLAYBACK_HELP}", flush=True)
     for step in range(int(np.ceil(duration / dt))):
       now = step * dt
       if result["failure"]:
@@ -170,7 +174,7 @@ def run_rally(
         for _ in range(cfg["decimation"]):
           robot.substep()
         viewer.sync()
-        time.sleep(max(wall_start + (step + 1) * dt - time.monotonic(), 0))
+        playback.wait((step+1)*dt)
         continue
       state = robot.state()
       if provider is not None:
@@ -305,9 +309,9 @@ def run_rally(
             )
             viewer.user_scn.ngeom += 1
         viewer.sync()
-        time.sleep(max(wall_start + (step + 1) * dt - time.monotonic(), 0))
+        playback.wait((step+1)*dt)
       elif provider is not None:
-        time.sleep(max(wall_start + (step + 1) * dt - time.monotonic(), 0))
+        playback.wait((step+1)*dt)
       if result["failure"]:
         if not render:
           break

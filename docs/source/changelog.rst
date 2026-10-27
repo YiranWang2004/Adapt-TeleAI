@@ -8,6 +8,60 @@ Upcoming version (not yet released)
 Added
 ^^^^^
 
+- Added ten pelvis-mounted mocap marker links to the G1 23-DoF calibration
+  URDF, with individually symmetric front/back layouts, physical edge alignment
+  datums, nominal pelvis offsets, and annotated mounting previews.
+- Added a separate ``deploy/`` G1 ping-pong runtime with directly selectable checkpoints,
+  CPU MuJoCo validation, HOPE-compatible VRPN/ROS ball-position input, UDP handoff,
+  and an optional Unitree SDK2 DDS backend with offline contract tests.
+  Policies and shared configuration paths can be overridden without model packaging.
+  Real deployment includes SDK/native-library checks, configurable network interfaces,
+  and read-only DDS diagnostics that work before motion capture is available.
+  MuJoCo live-input validation applies the real command guards, records failures,
+  and requires recovery after the final swing; position/planner cases are reproducible.
+  A continuous MuJoCo mode verifies preparation, receiving and recovery without
+  resetting the robot between swings, and preserves the scene after a halt.
+  Preparation and recovery now use first-frame tracker feedback shared by MuJoCo
+  and real deployment; sustained measured stability is required before arming.
+  A standing-only simulation mode verifies preparation and continuous holding.
+  Full-flow simulation uses observable incoming flights with table bounces,
+  and the shared receive planner predicts bounces before triggering a swing.
+  Swing/standing handoffs retain tracker action history; swing PD targets remain
+  unchanged while measured joint feedback and stream watchdogs are checked.
+  Refactored receiving around one Python HOPE-style rally controller shared by
+  MuJoCo and DDS: trajectory-based motion selection, late-frame alignment,
+  complete follow-through, and measured recovery before accepting another ball.
+  Added legal randomized incoming flights and continuous multi-swing records;
+  removed duplicate simulation loops and obsolete exported deployment bundles.
+  Documented checkpoint-specific recovery failures alongside passing results.
+  Halt diagnostics identify the measured joint and rejected control phase,
+  retain post-halt MuJoCo physics traces without stale policy targets, and
+  report active-control and damping-phase tilt separately with the physical clock.
+  Startup logs distinguish preparation/return home from swing candidates;
+  fixed motion selection ignores the automatic whitelist. Same-ball comparisons
+  document the effect of the home posture on the motion-19 handoff.
+  Corrected swing handoff history to exclude unsent standing actions and
+  aligned start frames with each candidate's own strike time and frame rate.
+  Removed the timed Stage-2 cutoff during follow-through; recorded remaining
+  cross-motion and return failures alongside training-input parity checks.
+  Fixed frozen-frame action history after command conditioning, honored target
+  guard switches during waiting/recovery, and retained measured-state guards.
+  Use each motion's strike plane; reject below-table launch states and predict
+  future descending bounces for rising balls. Added repeatable full-library
+  swing/recovery tests with five-second final holds and per-motion reports.
+  Freeze the home reference's train-to-world transform once from the first live
+  anchor pose, following HOPE's odometry-based fixed-world home. Preserve this
+  frame through every recovery and record it for coordinate diagnostics.
+  Added reproducible long-sequence motion screening with per-case configuration
+  snapshots, actual selected/recovered motion coverage, and independent-seed
+  validation of candidate whitelists without changing runtime control or guards.
+  Aligned real deployment with the validated MuJoCo home/motion defaults and
+  live-pose home capture. Added configurable HOPE PoseArray/PoseStamped input,
+  shared ROS/UDP coordinate normalization, and real lifecycle trace summaries;
+  documented integration with the existing filtered VRPN conversion pipeline.
+  Added an offline real-entry closed-loop check using MuJoCo feedback and HOPE
+  packets, including missing-input and stop cases. Reject Stage-1 checkpoints
+  before opening real receiving IO, matching the MuJoCo receiving contract.
 - Added Agibot A3 ping-pong motion tracking and frozen-tracker residual receiving
   tasks, named motion import, swept ball collisions, and local training validation.
 - Added an isolated 29-DoF Unitree G1 ping-pong asset, a provenance-bound 43-clip

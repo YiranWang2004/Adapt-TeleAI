@@ -9,6 +9,9 @@ from deploy.backends.mujoco import SimBall
 
 
 class RandomBallFeeder:
+  requires_motion_geometry = False
+  requires_over_net = False
+
   def __init__(self, ball_cfg, options, rng):
     self.cfg, self.options, self.rng = ball_cfg, options, rng
 
@@ -24,14 +27,10 @@ class RandomBallFeeder:
       racket_pos=np.full(3, 100.0), racket_normal=np.array([1.0, 0, 0])
     )
     for _ in range(64):
-      _, reference = candidates[int(self.rng.integers(len(candidates)))]
-      point = reference.strike_position(cfg).copy()
-      feed_reference = SimpleNamespace(
-        strike_position=lambda cfg, point=point: point,
-        strike_time=reference.strike_time,
-      )
+      index, reference = candidates[int(self.rng.integers(len(candidates)))]
       try:
-        ball = SimBall.receiving_feed(cfg, feed_reference, self.rng)
+        candidate_cfg, feed_reference, metadata = self.prepare(index, reference, cfg)
+        ball = SimBall.receiving_feed(candidate_cfg, feed_reference, self.rng)
       except ValueError:
         continue
       # Backwards reconstruction can extend a short post-bounce flight so far
@@ -44,9 +43,14 @@ class RandomBallFeeder:
       # physics; only legal incoming balls with a P1-side bounce are published.
       probe = copy.deepcopy(ball)
       bounces = []
+      incoming_net = None
       while probe.elapsed < probe.arrival:
         vz = probe.velocity[2]
+        before = probe.position.copy()
         probe.substep(dummy, 0.005)
+        if before[0] > net_x >= probe.position[0]:
+          fraction = (net_x - before[0]) / (probe.position[0] - before[0])
+          incoming_net = before + fraction * (probe.position - before)
         if vz < 0 < probe.velocity[2]:
           bounces.append(probe.position[0])
       if (
@@ -55,6 +59,36 @@ class RandomBallFeeder:
         and cfg["table_near_x"] <= bounces[0] < net_x
         and not probe.net_hit
         and np.linalg.norm(probe.position - probe.intercept) < 0.08
+        and (
+          not self.requires_over_net
+          or (
+            incoming_net is not None
+            and abs(incoming_net[1]) <= cfg["table_width"] / 2 - cfg["ball_radius"]
+            and incoming_net[2]
+            > cfg["table_height"] + cfg["net_height"] + cfg["ball_radius"]
+          )
+        )
       ):
+        ball.feed_metadata = {
+          **metadata,
+          "initial_position": ball.position.tolist(),
+          "initial_velocity": ball.velocity.tolist(),
+          "arrival_seconds": ball.arrival,
+          "incoming_net_crossing": incoming_net.tolist()
+          if incoming_net is not None
+          else None,
+          "incoming_table_bounces": len(bounces),
+          "probe_intercept_error_m": float(
+            np.linalg.norm(probe.position - probe.intercept)
+          ),
+        }
         return ball
     raise ValueError("No legal incoming feed in the configured motion/speed region")
+
+  def prepare(self, index, reference, cfg):
+    point = reference.strike_position(cfg).copy()
+    feed_reference = SimpleNamespace(
+      strike_position=lambda cfg, point=point: point,
+      strike_time=reference.strike_time,
+    )
+    return cfg, feed_reference, dict(motion_index=index, mode="point")

@@ -89,8 +89,10 @@ def receiving_metrics(path):
   path = Path(path)
   summary = json.loads((path / "summary.json").read_text())
   strikes = []
+  rows = []
   for line in (path / "trace.jsonl").open():
     row = json.loads(line)
+    rows.append(row)
     if (
       row.get("command_policy") == "hope_actor"
       and abs(row.get("time_to_strike", 1)) < 1e-6
@@ -105,6 +107,62 @@ def receiving_metrics(path):
         )
       )
   hits, balls = summary["simulated_hits"], summary["simulated_balls"]
+  timing = []
+  events = summary["events"]
+  dt = summary["simulation"]["policy_dt"]
+  for selected in (e for e in events if e["event"] == "motion_selected"):
+    finished = next(
+      (
+        e
+        for e in events
+        if e["event"] == "swing_finished" and e["time"] > selected["time"]
+      ),
+      None,
+    )
+    if finished is None:
+      continue
+    recovered = next(
+      (e for e in events if e["event"] == "recovered" and e["time"] > finished["time"]),
+      None,
+    )
+    swing = [
+      r
+      for r in rows
+      if selected["time"] <= r["time"] < finished["time"]
+      and r.get("state") == "EXECUTE"
+    ]
+    # Old recordings omit the frame-count/index fields. Keep their contact
+    # metrics, but only claim a frame audit when the diagnostic fields exist.
+    if not swing or "reference_frame_count" not in swing[0] or recovered is None:
+      continue
+    returning = [
+      r
+      for r in rows
+      if finished["time"] <= r["time"] < recovered["time"]
+      and r.get("state") == "RECOVER"
+    ]
+    count = swing[0]["reference_frame_count"]
+    frames = [r["reference_frame"] for r in swing]
+    return_indices = [r["return_frame_index"] for r in returning]
+    strike_rows = [r for r in swing if abs(r["time_to_strike"]) < 1e-6]
+    timing.append(
+      dict(
+        motion_index=selected["motion_index"],
+        start_frame=selected["start_frame"],
+        frame_count=count,
+        commanded_frames=len(frames),
+        consecutive_frames=frames == list(range(selected["start_frame"], count)),
+        expected_hold_seconds=(count - selected["start_frame"]) * dt,
+        actual_hold_seconds=finished["time"] - selected["time"],
+        last_frame_hold_seconds=finished["time"] - swing[-1]["time"],
+        return_commands=len(returning),
+        consecutive_return_indices=return_indices == list(range(len(returning))),
+        return_hold_seconds=recovered["time"] - finished["time"],
+        strike_deadline_error_seconds=(strike_rows[0]["time"] - selected["deadline"])
+        if strike_rows
+        else None,
+      )
+    )
   return dict(
     path=str(path),
     hits=hits,
@@ -112,6 +170,7 @@ def receiving_metrics(path):
     hit_rate=hits / balls if balls else 0.0,
     physics=summary["physics_validation"],
     strike_errors=strikes,
+    playback_timing=timing,
   )
 
 

@@ -25,6 +25,9 @@ def table_cfg(ball):
     raise ValueError("Invalid HOPE table dimensions")
   center = (near + far) / 2
   half_length, half_width = (far - near) / 2, width / 2
+  net_overhang = float(ball.get("net_overhang", 0))
+  if not np.isfinite(net_overhang) or net_overhang < 0:
+    raise ValueError("Invalid HOPE net overhang")
 
   def spec_fn():
     spec = mujoco.MjSpec()
@@ -51,7 +54,7 @@ def table_cfg(ball):
     box(
       "net",
       (center, 0, height + net_height / 2),
-      (0.003, half_width, net_height / 2),
+      (0.003, half_width + net_overhang, net_height / 2),
       (0.7, 0.7, 0.7, 0.75),
     )
     line_z = height + 0.0005

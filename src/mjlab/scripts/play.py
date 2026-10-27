@@ -3,7 +3,7 @@
 import os
 import sys
 import time as _time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Mapping
@@ -109,6 +109,15 @@ class PlayConfig:
   """Disable all termination conditions (useful for viewing motions with dummy agents)."""
   explore_jit: bool = False
   """If True, export `modeljit_xxx.pt` from loaded checkpoint during play."""
+  standing_cycle: bool = False
+  """Continuous home -> swing -> home validation; --viewer native opens a live window."""
+  cycle_home: int = 19
+  cycle_motions: str = "all"
+  """Comma-separated library indices, or all; one independent environment per clip."""
+  cycle_output: str = "logs/play_standing_cycle"
+  cycle_seed: int = 42
+  cycle_repeats: int = 1
+  """Independent complete trials per motion; seeds increment from cycle_seed."""
 
   # Internal flag used by demo script.
   _demo_mode: tyro.conf.Suppress[bool] = False
@@ -851,6 +860,10 @@ def run_play(task_id: str, cfg: PlayConfig):
 
   if cfg.num_envs is not None:
     env_cfg.scene.num_envs = cfg.num_envs
+  if cfg.standing_cycle:
+    from mjlab.scripts.standing_cycle import configure_cycle
+
+    configure_cycle(env_cfg, cfg)
   if cfg.video_height is not None:
     env_cfg.viewer.height = cfg.video_height
   if cfg.video_width is not None:
@@ -1030,7 +1043,10 @@ def run_play(task_id: str, cfg: PlayConfig):
       runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
       runner = runner_cls(env, asdict(agent_cfg), device=device)
       runner.load(
-        str(resume_path), load_cfg={"actor": True}, strict=True, map_location=device
+        str(resume_path),
+        load_cfg={"actor": True, "iteration": cfg.standing_cycle},
+        strict=True,
+        map_location=device,
       )
       if cfg.explore_jit:
         if resume_path is None:
@@ -1043,6 +1059,41 @@ def run_play(task_id: str, cfg: PlayConfig):
         jit_model.save(str(jit_path))
         print(f"[INFO]: Exported JIT policy to: {jit_path}")
       policy = runner.get_inference_policy(device=device)
+
+  if cfg.standing_cycle:
+    from mjlab.scripts.standing_cycle import run_cycle
+
+    if onnx_path is not None:
+      raise ValueError(
+        "standing-cycle requires a checkpoint with training iteration metadata"
+      )
+    env.unwrapped.current_learning_iteration = runner.current_learning_iteration
+    cycle_viewer = None
+    try:
+      if cfg.viewer == "native" and not cfg.video_headless:
+        cycle_viewer = NativeMujocoViewer(env, policy, enable_perturbations=False)
+        cycle_viewer.setup()
+      for trial in range(cfg.cycle_repeats):
+        trial_cfg = (
+          cfg
+          if cfg.cycle_repeats == 1
+          else replace(
+            cfg,
+            cycle_seed=cfg.cycle_seed + trial,
+            cycle_output=str(Path(cfg.cycle_output) / f"seed_{cfg.cycle_seed + trial}"),
+          )
+        )
+        run_cycle(env, policy, trial_cfg, task_id, viewer=cycle_viewer)
+        if cycle_viewer is not None and not cycle_viewer.is_running():
+          break
+    finally:
+      if cycle_viewer is not None:
+        cycle_viewer.close()
+        # launch_passive closes asynchronously. Let its render thread release
+        # the shared model/data before environment teardown and GLFW exit.
+        _time.sleep(0.5)
+      env.close()
+    return
 
   # Build checkpoint manager for hot-swapping checkpoints in the viewer.
   ckpt_manager: CheckpointManager | None = None

@@ -1,12 +1,13 @@
 """Independent reset-episode evaluation; separate from continuous deployment."""
 
 import json
-import time
 from pathlib import Path
 
 import numpy as np
 
 from deploy.backends.mujoco import MujocoBackend, SimBall
+from deploy.backends.playback import HELP as PLAYBACK_HELP
+from deploy.backends.playback import PlaybackControl
 from deploy.g1_pingpong.core import Controller, Motion, rotation
 from deploy.tools.traces import input_snapshot, save_trace
 
@@ -53,10 +54,12 @@ def run_mujoco(
   rng = np.random.default_rng(seed)
   indices = list(range(len(cfg["motions"]))) if all_motions else [motion_index]
   results, viewer = [], None
+  playback = PlaybackControl()
   if render:
     import mujoco.viewer
 
-    viewer = mujoco.viewer.launch_passive(backend.model, backend.data)
+    viewer = mujoco.viewer.launch_passive(backend.model, backend.data, key_callback=playback.key)
+    print(f"MuJoCo playback: {PLAYBACK_HELP}", flush=True)
   try:
     for index in indices:
       motion = Motion(
@@ -71,7 +74,7 @@ def run_mujoco(
         if ball:
           ball.previous_racket = backend.state().racket_pos
         traces, failed, reason = [], False, "time_out"
-        start = time.monotonic()
+        playback.reset(0.)
         thresholds = cfg.get("termination_thresholds", {})
         for step in range(
           round(cfg.get("episode_length_s", 3 if actor else 4) / cfg["control_dt"])
@@ -135,9 +138,7 @@ def run_mujoco(
                   np.array([1.0, 0.65, 0.1, 1.0]),
                 )
             viewer.sync()
-            time.sleep(
-              max(start + (step + 1) * cfg["control_dt"] - time.monotonic(), 0)
-            )
+            playback.wait((step+1)*cfg["control_dt"])
         report = {
           "motion": cfg["motions"][index],
           "repeat": repeat,

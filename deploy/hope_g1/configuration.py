@@ -2,7 +2,7 @@
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -86,11 +86,21 @@ class HopeDeployment(Deployment):
       num_motions=len(self.motions),
       motions=[dict(index=i, file=p.name) for i, p in enumerate(self.motions)],
       normalization="(obs - mean) / (std + 0.01)",
+      self_collisions=self.settings["hope"]["self_collisions"],
+      collision_source=self.settings["hope"]["collision_source"],
+      world_frame=self.settings["world_frame"],
+      simulation_world_translation=self.settings["simulation_world_translation"],
     )
 
 
 def load_deployment(
-  checkpoint, *, motion_dir=None, env_config=None, agent_config=None, ball_config=None
+  checkpoint,
+  *,
+  motion_dir=None,
+  env_config=None,
+  agent_config=None,
+  ball_config=None,
+  world_config=None,
 ):
   checkpoint = Path(checkpoint).resolve()
   run = checkpoint.parent
@@ -152,23 +162,70 @@ def load_deployment(
   from mjlab.scene import Scene, SceneCfg
   from mjlab.terrains import TerrainEntityCfg
 
-  if ball_config is None:
-    ball_config = yaml.safe_load(
-      (Path(__file__).parent / "configs/rally.yaml").read_text()
-    )["ball"]
+  defaults = yaml.safe_load(
+    (Path(__file__).parent / "configs/rally_mujoco.yaml").read_text()
+  )
+  ball_config = ball_config if ball_config is not None else defaults["ball"]
+  world_config = world_config if world_config is not None else defaults["world"]
+  from deploy.hope_g1.world import (
+    mujoco_ball_config,
+    simulation_translation,
+    validate_table_world,
+  )
+
+  validate_table_world(ball_config)
+  translation = simulation_translation(world_config)
+  simulation_ball = mujoco_ball_config(ball_config, translation)
 
   robot = get_g1_pingpong_robot_cfg()
+  # This task trained with its fast URDF and self-collisions enabled. Do not
+  # silently inherit the other deploy task's foot spheres/disabled self contact.
+  from functools import partial
+
+  from deploy.hope_g1.assets import training_collision_spec
+
+  urdf = run / "robot/g1_29dof_pingpong_fast.urdf"
+  if not urdf.is_file():
+    raise FileNotFoundError(
+      f"Migrate the training collision URDF into the task assets: {urdf}"
+    )
+  self_collisions = bool(
+    saved["scene"]["robot"]["spawn"]["articulation_props"]["enabled_self_collisions"]
+  )
+  robot.spec_fn = partial(training_collision_spec, robot.spec_fn, urdf, self_collisions)
+  robot.collisions = tuple(
+    replace(
+      c,
+      geom_names_expr=("hope_training_shape_.*",),
+      contype=1 if self_collisions else 0,
+      conaffinity=1,
+    )
+    for c in robot.collisions
+  )
   init = saved["scene"]["robot"]["init_state"]
   robot.init_state.joint_pos = init["joint_pos"]
   robot.init_state.joint_vel = init["joint_vel"]
   robot.init_state.pos = tuple(init["pos"])
   model = Scene(
     SceneCfg(
-      entities={"robot": robot, "table": table_cfg(ball_config)},
+      entities={"robot": robot, "table": table_cfg(simulation_ball)},
       terrain=TerrainEntityCfg(terrain_type="plane"),
     ),
     device="cpu",
   ).compile()
+  collision_ids = [
+    i
+    for i in range(model.ngeom)
+    if model.geom(i).name.startswith("robot/hope_training_shape_")
+  ]
+  if (
+    not collision_ids
+    or not np.all(model.geom_conaffinity[collision_ids] == 1)
+    or not np.all(model.geom_contype[collision_ids] == (1 if self_collisions else 0))
+  ):
+    raise ValueError(
+      "Training collision masks were not propagated into the compiled scene"
+    )
   joints = [model.joint("robot/" + n).id for n in names]
   default = resolve_patterns(init["joint_pos"], names, default=0.0)
   scales = resolve_patterns(action["scale"], names)
@@ -220,6 +277,9 @@ def load_deployment(
   policy = HopePolicy(checkpoint, agent)
   settings = dict(
     ball=dict(ball_config),
+    world_frame="hope_table",
+    simulation_world_translation=translation.tolist(),
+    simulation_ball=simulation_ball,
     task=TASK,
     stage="hope_multi_motion",
     iteration=policy.iteration,
@@ -240,6 +300,8 @@ def load_deployment(
       action_scale=scales.tolist(),
     ),
     hope=dict(
+      collision_source=str(urdf),
+      self_collisions=self_collisions,
       motion=motion,
       racket=racket,
       hit_types=hit_types,

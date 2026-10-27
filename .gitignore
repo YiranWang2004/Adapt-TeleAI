@@ -31,8 +31,13 @@ dataset/g1_pingpong_tele_gmr/raw/
 *clip**
 command.md
 host_readme.md
+<<<<<<< Updated upstream
 
 
 dataset/
 
 ckpts/g1*
+=======
+src/mjlab/asset_zoo/robots/unitree_g1_pingpong/marker_test/
+tests/
+>>>>>>> Stashed changes

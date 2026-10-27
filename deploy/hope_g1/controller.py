@@ -8,6 +8,8 @@ from deploy.g1_pingpong.core import quaternion_multiply, rotation
 from deploy.g1_pingpong.lifecycle import Lifecycle
 from deploy.g1_pingpong.motions import MotionLibrary, RebasedMotion
 from deploy.g1_pingpong.perception import ReceivePlanner
+from deploy.hope_g1.a3_planner import ReceivePlan, command_goal
+from deploy.hope_g1.hope_planner_adapter import HopePlannerAdapter
 
 
 @dataclass
@@ -49,7 +51,9 @@ class HopeActorController:
     policy_world_inv = reference.rotation.T
     # Use measured odometry, also in simulation; no plant-velocity oracle.
     velocity = np.zeros(3)
-    if self.previous_time is not None:
+    if hasattr(state, "root_velocity_world"):
+      velocity = np.asarray(state.root_velocity_world).copy()
+    elif self.previous_time is not None:
       elapsed = now - self.previous_time
       if elapsed <= 0:
         raise ValueError("HOPE observation time must increase")
@@ -130,7 +134,7 @@ class HopeStanding:
 
 
 class HopeController:
-  """Fixed-home receiving lifecycle around a single HOPE actor.
+  """A3-compatible triggered receiving around a single G1 HOPE actor.
 
   Goals latch at selection. Idle/return use frame zero and the same actor;
   the motion clock advances only during EXECUTE. No tracker is substituted.
@@ -150,6 +154,31 @@ class HopeController:
     auto_arm=False,
   ):
     self.cfg, self.runtime, self.options = deployment.settings, runtime, options
+    self.target_source = options.get("target_source", "reference")
+    if self.target_source == "a3_planner":
+      # Keep old command lines/configs usable while routing them to the exact
+      # current ROS planner core rather than the previous local A3 clone.
+      self.target_source = "hope_planner_optimized_2"
+    if self.target_source not in ("reference", "hope_planner_optimized_2"):
+      raise ValueError("target_source must be reference or hope_planner_optimized_2")
+    self.planner_active = self.target_source == "hope_planner_optimized_2"
+    self.a3_options = options.get("a3", {})
+    self.target_mode = self.a3_options.get("target_mode", "raw")
+    self.reference_mode = self.a3_options.get("reference_mode", "a3_live")
+    if self.target_mode not in ("raw", "envelope") or self.reference_mode not in (
+      "a3_live",
+      "training_common",
+    ):
+      raise ValueError("Invalid A3 target_mode/reference_mode")
+    self.command_planner = (
+      HopePlannerAdapter(
+        hit_plane_x=self.a3_options.get("hit_plane_x", -0.25),
+        config_path=options.get("hope_planner_config"),
+      )
+      if self.planner_active else None
+    )
+    self.select_ready_time = 0.0
+    self.raw_command = None
     if self.cfg["task"] != "HOPEPingPongMultiMotionG1":
       raise ValueError("HopeController requires the independent HOPE task")
     if selection not in ("fixed", "auto"):
@@ -199,6 +228,10 @@ class HopeController:
       np.asarray(racket["ref_perturb_pos"]) * self.target_perturb_scale
     )
     self.recovery_stable_since = None
+    self.return_frame_count = round(
+      self.cfg["hope"]["return_seconds"] / self.cfg["control_dt"]
+    )
+    self.return_frames_sent = 0
     self.command_debug = {}
 
   @property
@@ -218,10 +251,21 @@ class HopeController:
     return (
       f"[hope_g1] task={self.cfg['task']}; home={self.home_index} "
       f"({self.library.paths[self.home_index].name}); selection={self.selection}; "
-      f"candidates={self.candidate_indices}; actor=175->29"
+      f"candidates={self.candidate_indices}; actor=175->29; target_source={self.target_source}"
     )
 
   def candidates(self, state):
+    if self.planner_active and self.reference_mode == "a3_live":
+      # A3 idle_rebase_for_motion with --fixed-world-home: each clip's frame
+      # zero anchor is placed at the frozen home's ready anchor.
+      if self.home_frozen:
+        _, position, quaternion = self.home.sample(0)
+      else:
+        position, quaternion = state.anchor_pos, state.anchor_quat
+      return [
+        (i, RebasedMotion(self.library.motions[i], position, quaternion))
+        for i in self.candidate_indices
+      ]
     references = self.references or self.aligned_library(state)
     return [(i, references[i]) for i in self.candidate_indices]
 
@@ -267,6 +311,8 @@ class HopeController:
     return RacketGoal(position, normal * sign * cfg["ref_velocity_speed"], normal, base)
 
   def select(self, state, estimate, now):
+    if self.planner_active:
+      return self.select_planner_command(state, estimate, now)
     choices = []
     for index, reference in self.candidates(state):
       planner = ReceivePlanner(
@@ -282,12 +328,17 @@ class HopeController:
       distance = float(
         np.linalg.norm(planner.plan[0] - reference.strike_position(self.cfg["ball"]))
       )
-      offset = planner.plan[0] - reference.strike_position(self.cfg["ball"])
+      offset_world = planner.plan[0] - reference.strike_position(self.cfg["ball"])
+      # The training perturbation box is axis-aligned in NPZ/Isaac world,
+      # exactly like the absolute-vector terms in the actor observation.
+      offset = reference.rotation.T @ offset_world
       if np.any(np.abs(offset) > self.target_offset_limit):
         self.debug["decision"] = dict(
           reason="goal_outside_play_perturbation",
           motion_index=index,
           offset=offset.tolist(),
+          offset_frame="training_world",
+          offset_deploy_world=offset_world.tolist(),
           allowed_offset=self.target_offset_limit.tolist(),
         )
         continue
@@ -297,16 +348,93 @@ class HopeController:
       return None
     return min(choices, key=lambda choice: (choice[0], choice[1]))
 
+  def select_planner_command(self, state, estimate, now):
+    if now < self.select_ready_time:
+      self.debug["decision"] = dict(
+        reason="planner_selection_settle", remaining=self.select_ready_time - now
+      )
+      return None
+    command = self.command_planner.latest_command(now)
+    if command is None:
+      self.debug["decision"] = dict(
+        self.command_planner.last_update_diagnostics
+        or {"reason": "planner_has_no_published_command"}
+      )
+      return None
+    return self.select_racket_command(state, command, now)
+
+  def update_ball_observations(self, observations):
+    """Feed source-rate mocap packets directly to the ROS-equivalent planner."""
+    if self.planner_active and observations:
+      self.command_planner.update_observations(observations)
+
+  def select_racket_command(self, state, command, now):
+    """Select using only a public command, independent of its producer."""
+    if now < self.select_ready_time:
+      self.debug["decision"] = dict(reason="planner_selection_settle")
+      return None
+    remaining = command.deadline - now
+    maximum = self.a3_options.get("max_command_time_to_strike", 0.5)
+    scores = []
+    for index in self.candidate_indices:
+      reference = (
+        RebasedMotion(self.library.motions[index], state.anchor_pos, state.anchor_quat)
+        if self.reference_mode == "a3_live"
+        else dict(self.candidates(state))[index]
+      )
+      distance = float(
+        np.linalg.norm(command.position - reference.strike_position(self.cfg["ball"]))
+      )
+      scores.append((distance, index, reference))
+    best = min(scores, key=lambda item: (item[0], item[1]))
+    current = next((item for item in scores if item[1] == self.motion_index), None)
+    if (
+      current
+      and best[1] != current[1]
+      and not best[0] + self.options.get("selection_hysteresis", 0.05) < current[0]
+    ):
+      best = current
+    distance, index, reference = best
+    if distance > self.options["max_intercept_distance"]:
+      self.debug["decision"] = dict(
+        reason="a3_intercept_unreachable",
+        distance=distance,
+        motion_index=index,
+        command=command.diagnostic,
+      )
+      return None
+    # A3 only re-initializes the transform when switching motion. The active
+    # home keeps its frozen transform when selected again.
+    if self.reference_mode == "a3_live" and index == self.home_index:
+      reference = self.home
+    lead = reference.strike_time(self.cfg["ball"])
+    start = max(0, int(np.floor((lead - remaining) * reference.fps + 0.5)))
+    diagnostic = dict(
+      command.diagnostic,
+      start_frame=start,
+      motion_index=index,
+      remaining=remaining,
+      target_mode=self.target_mode,
+    )
+    if remaining <= 0 or remaining > maximum or start > self.options["max_start_frame"]:
+      self.debug["decision"] = dict(diagnostic, reason="arrival_outside_start_window")
+      return None
+    self.debug["decision"] = dict(diagnostic, reason="accepted")
+    return distance, index, reference, ReceivePlan(command, diagnostic)
+
   def start_policy(self, target, now, *, reset_history=False, blend_reference=True):
     if self.lifecycle.state not in ("STABLE", "POSE_HOLD"):
       raise RuntimeError("HOPE policy entry requires STABLE or POSE_HOLD")
     self.controller.reset()
-    # Match the actual training reset: last_action starts at zero.
+    # Preserve the existing entry flow and training's zero initial raw action.
     self.lifecycle.state = "ARMED"
     self.previous_target = np.asarray(target).copy()
     self.home_frozen = False
     self.references = None
     self.frame = 0
+    self.return_frames_sent = 0
+    self.raw_command = None
+    self.select_ready_time = now
     self.events.append(dict(time=now, event="hope_policy_enabled"))
 
   def reset_manual_policy(self, now):
@@ -316,10 +444,15 @@ class HopeController:
     self.references = None
     self.goal = self.planner = None
     self.motion_index = self.home_index
+    self.return_frames_sent = 0
     self.lifecycle.state = "WAIT"
     self.events.append(dict(time=now, event="returned_to_stable"))
 
-  def step(self, state, estimate, now):
+  def step(self, state, estimate, now, *, racket_command=None):
+    if racket_command is not None and (
+      not self.planner_active or self.target_mode != "raw"
+    ):
+      raise ValueError("Direct racket commands require the A3 raw target contract")
     if self.lifecycle.state == "HALT":
       return None
     if not self.home_frozen:
@@ -327,6 +460,13 @@ class HopeController:
       self.home = self.references[self.home_index]
       self.standing.home = self.home
       self.home_goal = self.reference_goal(self.home, self.home_index, home=True)
+      if self.planner_active:
+        # A3 derives idle/return base target from the home strike-frame reach,
+        # not from frame-zero pelvis XY.
+        self.home_goal = self.reference_goal(self.home, self.home_index)
+        self.select_ready_time = (
+          now + self.a3_options.get("select_settle_ticks", 25) * self.cfg["control_dt"]
+        )
       self.home_frozen = True
       self.events.append(
         dict(
@@ -344,6 +484,27 @@ class HopeController:
         raise error
       self.physical_limit_observer("hope_tilt", error)
     self.debug = {"decision": {"reason": "waiting_for_ball"}}
+    # Each reference is held for a complete control interval. Transition on
+    # the next tick after frame N-1, as MotionCommand does after env.step().
+    if self.lifecycle.state == "EXECUTE" and self.frame >= len(self.reference.q):
+      self.completed += 1
+      self.lifecycle.recover(state.q, now)
+      self.recovery_stable_since = None
+      self.return_frames_sent = 0
+      self.events.append(
+        dict(
+          time=now,
+          event="swing_finished",
+          motion_index=self.motion_index,
+          final_frame=len(self.reference.q) - 1,
+        )
+      )
+      if self.planner_active:
+        self.motion_index = self.home_index
+        self.raw_command = None
+        self.select_ready_time = (
+          now + self.a3_options.get("select_settle_ticks", 25) * self.cfg["control_dt"]
+        )
     if self.lifecycle.state == "RECOVER":
       settled, _ = self.standing.observe(state)
       self.recovery_stable_since = (
@@ -352,7 +513,7 @@ class HopeController:
         else None
       )
       elapsed = now - self.lifecycle.transition_start
-      ready = elapsed >= self.cfg["hope"]["return_seconds"]
+      ready = self.return_frames_sent >= self.return_frame_count
       if self.standing.readiness_mode == "measured":
         ready &= (
           self.recovery_stable_since is not None
@@ -368,19 +529,51 @@ class HopeController:
         self.events.append(dict(time=now, event="recovered", home=self.home_index))
       elif elapsed > self.runtime["standing"]["timeout_seconds"]:
         raise TimeoutError("HOPE recovery did not stabilize")
-    if self.lifecycle.state == "ARMED" and self.receiving and estimate is not None:
-      choice = self.select(state, estimate, now)
+    if (
+      self.lifecycle.state == "ARMED"
+      and self.receiving
+      and (
+        estimate is not None
+        or racket_command is not None
+        or (self.planner_active and self.command_planner.latest_command(now) is not None)
+      )
+    ):
+      choice = (
+        self.select_racket_command(state, racket_command, now)
+        if racket_command is not None
+        else self.select(state, estimate, now)
+      )
       if choice is not None:
         distance, self.motion_index, self.reference, self.planner = choice
         self.frame = int(self.planner.diagnostic["start_frame"])
         self.goal = self.reference_goal(self.reference, self.motion_index)
-        # The planner supplies desired contact position; velocity/face normal
-        # retain the trained reference goal convention and stroke sign.
+        # The explicit reference baseline only retargets position. The A3
+        # branch below replaces it with the complete latched RacketCommand.
         displacement = self.planner.plan[0] - self.goal.position
         # RacketTargetCommand couples XY base placement to contact position:
         # target_base_xy = target_racket_xy - reference_reach_offset_xy.
         self.goal.base_xy = self.goal.base_xy + displacement[:2]
         self.goal.position = self.planner.plan[0].copy()
+        if self.planner_active:
+          self.raw_command = self.planner.command
+          nominal = self.reference_goal(self.reference, self.motion_index)
+          sign = (
+            -1
+            if self.library.hit_types[self.motion_index]
+            in self.cfg["hope"]["racket"]["ref_velocity_backhand_values"]
+            else 1
+          )
+          self.goal = RacketGoal(
+            *command_goal(
+              self.raw_command,
+              nominal,
+              self.reference,
+              self.cfg["hope"]["racket"],
+              sign,
+              self.target_mode,
+              self.target_perturb_scale,
+            )
+          )
         self.lifecycle.execute(now)
         self.events.append(
           dict(
@@ -391,6 +584,8 @@ class HopeController:
             distance=distance,
             start_frame=self.frame,
             deadline=self.planner.plan[1],
+            target_source=self.target_source,
+            raw_command=self.raw_command.diagnostic if self.raw_command else None,
           )
         )
     executing = self.lifecycle.state == "EXECUTE"
@@ -410,15 +605,19 @@ class HopeController:
     )
     self.command_policy = "hope_actor"
     self.command_debug = self.controller.debug
+    self.command_debug.update(
+      target_source=self.target_source,
+      planner_target_mode=self.target_mode if self.planner_active else None,
+      raw_racket_command=self.raw_command.diagnostic if self.raw_command else None,
+      reference_frame_count=len(reference.q),
+      return_frame_index=self.return_frames_sent
+      if self.lifecycle.state == "RECOVER"
+      else None,
+    )
     self.debug.update(self.command_debug)
     self.previous_target = target.copy()
     if executing:
       self.frame += 1
-      if self.frame >= len(reference.q):
-        self.completed += 1
-        self.lifecycle.recover(state.q, now)
-        self.recovery_stable_since = None
-        self.events.append(
-          dict(time=now, event="swing_finished", motion_index=self.motion_index)
-        )
+    elif self.lifecycle.state == "RECOVER":
+      self.return_frames_sent += 1
     return target

@@ -21,13 +21,36 @@ class BallEstimate:
 class BallEstimator:
   """Fit position/velocity at the newest source time, never callback time."""
 
-  def __init__(self, window=9, max_gap=0.1, stale_timeout=0.1):
+  def __init__(
+    self,
+    window=9,
+    max_gap=0.1,
+    stale_timeout=0.1,
+    minimum_samples=3,
+    window_seconds=None,
+    bounce_height=None,
+    bounce_tolerance=0.03,
+    bounce_min_speed=0.0,
+  ):
     if window < 3 or max_gap <= 0 or stale_timeout <= 0:
       raise ValueError("Invalid estimator configuration")
     self.samples = deque(maxlen=window)
+    # Preserve source-rate position packets for planners whose estimator must
+    # see every mocap frame (the deployment BallEstimate remains unchanged).
+    self._observation_queue = deque(maxlen=4096)
+    self._observation_drops = 0
     self.max_gap, self.stale_timeout = max_gap, stale_timeout
     self.lock = threading.Lock()
     self.latest = None
+    if not 3 <= minimum_samples <= window or (
+      window_seconds is not None and window_seconds <= 0
+    ):
+      raise ValueError("Invalid polynomial fit window/minimum_samples")
+    self.minimum_samples, self.window_seconds = minimum_samples, window_seconds
+    self.bounce_height, self.bounce_tolerance = bounce_height, bounce_tolerance
+    if bounce_min_speed < 0 or not np.isfinite(bounce_min_speed):
+      raise ValueError("Invalid minimum bounce speed")
+    self.bounce_min_speed = bounce_min_speed
 
   def update(self, position, stamp, *, received=None):
     received = time.monotonic() if received is None else received
@@ -39,13 +62,33 @@ class BallEstimator:
     ):
       raise ValueError("Invalid ball sample")
     with self.lock:
+      if len(self._observation_queue) == self._observation_queue.maxlen:
+        self._observation_drops += 1
+      self._observation_queue.append((float(stamp), position.copy(), received))
       if self.samples and stamp <= self.samples[-1][0]:
         return False
       if self.samples and stamp - self.samples[-1][0] > self.max_gap:
         self.samples.clear()
         self.latest = None
+      # A3 Stage 1 clears the polynomial across a table-bounce discontinuity.
+      # Account for the sphere radius and finite sampling rate in the height
+      # tolerance; do not fit descending and ascending arcs as one parabola.
+      if self.bounce_height is not None and len(self.samples) >= 2:
+        z0, z1, z2 = self.samples[-2][1][2], self.samples[-1][1][2], position[2]
+        t0, t1 = self.samples[-2][0], self.samples[-1][0]
+        if (
+          z0 > z1 < z2
+          and abs(z1 - self.bounce_height) <= self.bounce_tolerance
+          and (z0 - z1) / (t1 - t0) >= self.bounce_min_speed
+          and (z2 - z1) / (stamp - t1) >= self.bounce_min_speed
+        ):
+          self.samples.clear()
+          self.latest = None
       self.samples.append((stamp, position.copy()))
-      if len(self.samples) >= 3:
+      if self.window_seconds is not None:
+        while self.samples and stamp - self.samples[0][0] > self.window_seconds:
+          self.samples.popleft()
+      if len(self.samples) >= self.minimum_samples:
         times = np.array([s[0] - stamp for s in self.samples])
         design = np.column_stack([np.ones(len(times)), times, times**2])
         coefficients = np.linalg.lstsq(
@@ -53,6 +96,13 @@ class BallEstimator:
         )[0]
         self.latest = BallEstimate(coefficients[0], coefficients[1], stamp, received)
     return True
+
+  def drain_observations(self):
+    """Return and remove raw ``(source_stamp, position, received)`` packets."""
+    with self.lock:
+      rows = list(self._observation_queue)
+      self._observation_queue.clear()
+    return rows
 
   def get(self, now=None):
     now = time.monotonic() if now is None else now
@@ -67,7 +117,11 @@ class BallEstimator:
 
 class RootPoseCache:
   def __init__(
-    self, offset, stale_timeout=0.1, orientation_offset=(1.0, 0.0, 0.0, 0.0)
+    self,
+    offset,
+    stale_timeout=0.1,
+    orientation_offset=(1.0, 0.0, 0.0, 0.0),
+    conditioning=None,
   ):
     self.offset = np.asarray(offset, dtype=float)
     self.stale_timeout = stale_timeout
@@ -75,6 +129,10 @@ class RootPoseCache:
     rotation(self.orientation_offset)
     self.latest = None
     self.lock = threading.Lock()
+    from deploy.io.pose_conditioning import PoseConditioner
+
+    self.conditioner = PoseConditioner(conditioning) if conditioning else None
+    self.velocity_history = deque(maxlen=16)
 
   def update(self, position, quaternion, stamp, *, received=None):
     received = time.monotonic() if received is None else received
@@ -91,8 +149,15 @@ class RootPoseCache:
       if self.latest is not None and stamp <= self.latest[2]:
         return
       quaternion = quaternion_multiply(quaternion, self.orientation_offset)
+      position = position + r @ self.offset
+      if self.conditioner is not None:
+        conditioned = self.conditioner.update(position, quaternion, stamp, received)
+        if conditioned is None:
+          return
+        position, quaternion = conditioned
+        self.velocity_history.append((stamp, self.conditioner.velocity.copy()))
       self.latest = (
-        position + r @ self.offset,
+        position,
         quaternion / np.linalg.norm(quaternion),
         stamp,
         received,
@@ -104,6 +169,14 @@ class RootPoseCache:
       if self.latest is None or now - self.latest[3] > self.stale_timeout:
         return None
       return tuple(v.copy() if isinstance(v, np.ndarray) else v for v in self.latest)
+
+  def velocity_for_source(self, stamp):
+    """Return velocity from the same accepted pose, even if a callback advanced."""
+    with self.lock:
+      for source, velocity in reversed(self.velocity_history):
+        if source == stamp:
+          return velocity.copy()
+    return None
 
 
 def predict(position, velocity, duration, gravity=9.81, drag=0.0):
@@ -134,7 +207,7 @@ def intercept_without_drag(position, velocity, plane_x, cfg, horizon):
       if (
         candidate >= 0
         and cfg["table_near_x"] <= contact[0] <= cfg["table_far_x"]
-        and abs(contact[1]) <= cfg["table_width"] / 2
+        and abs(contact[1] - cfg.get("table_center_y", 0.0)) <= cfg["table_width"] / 2
       ):
         bounce_time = candidate
     if crossing <= bounce_time:

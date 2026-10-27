@@ -915,6 +915,8 @@ def run_control_loop(
     "real_runtime_config": real_cfg,
     "rally_runtime_config": options,
     "mocap_runtime_config": mocap_cfg,
+    "control_world_frame": cfg.get("world_frame", mocap_cfg["world_frame"]),
+    "simulation_world_translation": cfg.get("simulation_world_translation"),
     "control_dt": cfg["control_dt"],
     "physics_dt": cfg["physics_dt"],
     "diagnostic_schema_version": 5,
@@ -1292,6 +1294,15 @@ def run_control_loop(
       )
       kinematics.forward_kinematics()
       observed = kinematics.state()
+      # Optional source-rate conditioning belongs to the pose receiver, not
+      # the policy timer. Existing tasks without it keep their old behavior.
+      velocity_for_source = getattr(mocap.root, "velocity_for_source", None)
+      if velocity_for_source is not None:
+        velocity = velocity_for_source(root[2])
+        if velocity is not None:
+          observed.root_velocity_world = (
+            np.zeros(3) if root_grace is not None and root_grace.frozen else velocity
+          )
       kinematics_seconds = clock.monotonic() - kinematics_started
       observed.gyro = rotation(real_cfg["imu_to_pelvis_quaternion_wxyz"]) @ gyro
       if enter_policy:
@@ -1306,6 +1317,9 @@ def run_control_loop(
         else:
           engine.start_policy(lifecycle.posture_target(now), now)
       estimate = mocap.ball.get(now)
+      drain_observations = getattr(mocap.ball, "drain_observations", None)
+      if drain_observations is not None and hasattr(engine, "update_ball_observations"):
+        engine.update_ball_observations(drain_observations())
       policy_started = clock.monotonic()
       target = engine.step(observed, estimate, now)
       policy_seconds = clock.monotonic() - policy_started

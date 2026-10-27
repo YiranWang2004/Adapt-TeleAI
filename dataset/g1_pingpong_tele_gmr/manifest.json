@@ -604,7 +604,7 @@
       "source_bvh_sha256": "078898a9f5a7518be141076d38935463ca288e381e6f6965ce51fe2bd2e2e341",
       "source_validation": {
         "max_fk_position_error_m": 6.38811545787055e-08,
-        "max_com_velocity_error_m_s": 4.63039906165662e-08,
+        "max_com_velocity_error_m_s": 4.630399061656621e-08,
         "max_root_link_velocity_error_m_s": 0.0
       }
     },
@@ -1262,7 +1262,7 @@
       "source_bvh_sha256": "bd07ebd21ecddb4092a9276073341d576864a19b2b8d143ac139ebc0bed09bab",
       "source_validation": {
         "max_fk_position_error_m": 8.158960658641673e-08,
-        "max_com_velocity_error_m_s": 4.107795876585747e-08,
+        "max_com_velocity_error_m_s": 4.1077958765857464e-08,
         "max_root_link_velocity_error_m_s": 0.0
       }
     },
@@ -1403,7 +1403,7 @@
       "source_bvh_sha256": "81793fdfce4d094eddbe6baba4d659f33c8a294ba53c0e6e1729a487114d0999",
       "source_validation": {
         "max_fk_position_error_m": 7.391909305863278e-08,
-        "max_com_velocity_error_m_s": 3.253652516961604e-08,
+        "max_com_velocity_error_m_s": 3.2536525169616044e-08,
         "max_root_link_velocity_error_m_s": 0.0
       }
     },
@@ -1433,7 +1433,7 @@
       ],
       "source_initial_root_rpy_deg": [
         -0.2485428332566213,
-        2.9742162668947167,
+        2.974216266894704,
         -90.54440157525092
       ],
       "initial_root_height_m": 0.804773211479187,
@@ -1544,7 +1544,7 @@
       "source_bvh_sha256": "5faad8c6f806a521b4bd70f85618bd8d2058b5ed1126fe9d902b73ae5fb6429d",
       "source_validation": {
         "max_fk_position_error_m": 6.229893070473081e-08,
-        "max_com_velocity_error_m_s": 2.928772101153117e-08,
+        "max_com_velocity_error_m_s": 2.9287721011531167e-08,
         "max_root_link_velocity_error_m_s": 0.0
       }
     },
@@ -1809,7 +1809,7 @@
       ],
       "source_initial_root_rpy_deg": [
         -0.5994944628994398,
-        2.037165269620823,
+        2.03716526962081,
         -88.76221968915057
       ],
       "initial_root_height_m": 0.7949035167694092,
@@ -1902,7 +1902,7 @@
         0.7963203191757202
       ],
       "source_initial_root_rpy_deg": [
-        -0.8052728597543244,
+        -0.8052728597543307,
         1.2402239410708427,
         -89.59584505546361
       ],

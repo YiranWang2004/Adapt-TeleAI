@@ -1,5 +1,7 @@
 # G1 乒乓球 Python 部署
 
+HOPE G1 当前仿真入口统一见 [仿真测试与回看指令](SIMULATION_TESTS.md)：包含策略指令评测、策略＋planner 接球评测、连续 MuJoCo 演示、真机日志回看及 planner 诊断。
+
 常用命令：[基础 play 与 MuJoCo 测试](PLAY_AND_MUJOCO.md) ·
 [真机部署](REAL_DEPLOYMENT.md) · [MuJoCo 详细说明](MUJOCO_TESTING.md)。
 

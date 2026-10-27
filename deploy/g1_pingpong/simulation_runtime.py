@@ -18,6 +18,8 @@ import numpy as np
 import yaml
 
 from deploy.backends.mujoco import MujocoBackend
+from deploy.backends.playback import HELP as PLAYBACK_HELP
+from deploy.backends.playback import PlaybackControl
 from deploy.backends.runtime import SimulationIO, SimulationReset
 from deploy.backends.unitree import run_real
 from deploy.g1_pingpong.commands import policy_pd_settings
@@ -45,6 +47,7 @@ class SimulatedMocap(UDPMocap):
       config["root_marker_to_pelvis"],
       config["root_stale_timeout"],
       config.get("root_marker_to_pelvis_quaternion_wxyz", (1, 0, 0, 0)),
+      conditioning=config.get("root_pose_filter"),
     )
     self.ball = BallEstimator(**config["estimator"])
     self.recorder = (
@@ -54,7 +57,10 @@ class SimulatedMocap(UDPMocap):
     )
     self.external = build_mocap(config) if external_ball else None
     if self.external:
-      self.ball = SimpleNamespace(get=self.external_estimate)
+      self.ball = SimpleNamespace(
+        get=self.external_estimate,
+        drain_observations=self.external.ball.drain_observations,
+      )
 
   def external_estimate(self, now):
     sample = self.external.ball.get(time.monotonic())
@@ -110,6 +116,7 @@ class MujocoRuntime:
     final_hold,
     startup,
     ball_source,
+    feeder_factory=RandomBallFeeder,
     _robot=None,
     _viewer=None,
   ):
@@ -124,9 +131,17 @@ class MujocoRuntime:
       final_hold=final_hold,
       startup=startup,
       ball_source=ball_source,
+      feeder_factory=feeder_factory,
     )
     self.deployment, self.runtime = deployment, runtime
     self.cfg = policy_pd_settings(deployment.settings, runtime)
+    # The physical MuJoCo plant stays in its floor world, while simulated
+    # mocap and the controller use the same HOPE world as live ROS inputs.
+    self.world_translation = np.asarray(
+      self.cfg.get("simulation_world_translation", [0.0, 0.0, 0.0])
+    )
+    if "simulation_ball" in self.cfg:
+      self.cfg = {**self.cfg, "ball": self.cfg["simulation_ball"]}
     self.options = options
     self.controls, self.render, self.episodes = controls, render, episodes
     self.standing_only, self.stable_seconds, self.policy_wait, self.final_hold = (
@@ -138,7 +153,9 @@ class MujocoRuntime:
     self.feed_interval = float(options["feed"].get("interval_seconds", 2.0))
     if not np.isfinite(self.feed_interval) or self.feed_interval <= 0:
       raise ValueError("Simulated feed interval must be finite and positive")
-    self.continuous_feed = controls == "auto"
+    self.continuous_feed = controls == "auto" or bool(
+      options["feed"].get("continuous_on_policy_entry", False)
+    )
     self.feed_references = None
     self.fallback_feed_references = []
     self.first_feed_time = None
@@ -175,6 +192,7 @@ class MujocoRuntime:
     )
     self.keys = []
     self.ball = None
+    self.served_balls = []
     self.hits = self.served = 0
     self.next_serve = self.armed_since = self.finished_since = None
     self.force_ball = False
@@ -183,7 +201,8 @@ class MujocoRuntime:
     self.support_z = 0.90
     self.landing_started = None
     self.wall_start = time.monotonic()
-    self.feeder = RandomBallFeeder(
+    self.playback = PlaybackControl(options.get("playback_rate", 1.))
+    self.feeder = feeder_factory(
       self.cfg["ball"], options["feed"], np.random.default_rng(seed)
     )
     self.startup = startup
@@ -200,6 +219,9 @@ class MujocoRuntime:
       feed_interval_seconds=self.feed_interval,
       feed_schedule="independent periodic arrivals; no stance readiness gate",
       actual_robot_commands_sent=False,
+      physics_world_frame="mujoco_floor",
+      control_world_frame=self.cfg.get("world_frame", "world"),
+      mujoco_to_control_translation=self.world_translation.tolist(),
       actual_network_connections=ball_source == "mocap",
       ideal_io=True,
       physical_limit_mode="observe_only; policy and physics continue",
@@ -210,10 +232,14 @@ class MujocoRuntime:
       from mujoco import viewer
 
       previous_threads = set(threading.enumerate())
-      self.viewer = viewer.launch_passive(
-        self.robot.model, self.robot.data, key_callback=self.key
-      )
       camera = options.get("viewer", {})
+      self.viewer = viewer.launch_passive(
+        self.robot.model,
+        self.robot.data,
+        key_callback=self.key,
+        show_left_ui=camera.get("show_left_ui", True),
+        show_right_ui=camera.get("show_right_ui", True),
+      )
       with self.viewer.lock():
         if "lookat" in camera:
           self.viewer.cam.lookat[:] = camera["lookat"]
@@ -230,6 +256,7 @@ class MujocoRuntime:
         "MuJoCo keys: ENTER=START, SPACE/P=pause/resume, L=lower, A=AMP, W=UP/pingpong, S=DOWN/AMP, F=ball, T=continuous feed, R=reset, N=single step, B/X=halt, Q=quit, H=help",
         flush=True,
       )
+      print(f"MuJoCo playback: {PLAYBACK_HELP}", flush=True)
 
   def monotonic(self):
     return self.ticks * self.cfg["physics_dt"]
@@ -238,6 +265,8 @@ class MujocoRuntime:
     return 10000 + self.monotonic()
 
   def key(self, key):
+    if self.playback.key(key):
+      return
     if ord("a") <= key <= ord("z"):
       key -= 32
     if key == ord("R"):
@@ -257,6 +286,7 @@ class MujocoRuntime:
         "ENTER=START, SPACE/P=pause/resume, L=lower, A=AMP, W=UP/pingpong, S=DOWN/AMP, F=ball, T=continuous feed, R=reset, N=single step, B/X=halt, Q=quit",
         flush=True,
       )
+      print(f"Playback {self.playback.rate:g}x: {PLAYBACK_HELP}", flush=True)
       return
     if key in (ord("Q"), ord("B"), ord("X")):
       self.paused = False
@@ -267,6 +297,8 @@ class MujocoRuntime:
       return
     if key == ord("T"):
       self.continuous_feed = not self.continuous_feed
+      if not self.continuous_feed:
+        self.next_serve = None
       self.next_serve = None
       print(
         f"[MuJoCo] continuous feed: {self.continuous_feed}, interval={self.feed_interval}s",
@@ -301,6 +333,7 @@ class MujocoRuntime:
 
   def reset(self):
     """Fresh plant and IO on the same viewer; run_real rebuilds every policy."""
+    rate = self.playback.rate
     with self.viewer.lock() if self.viewer else nullcontext():
       self.__init__(
         self.deployment,
@@ -310,6 +343,7 @@ class MujocoRuntime:
         _robot=self.robot,
         _viewer=self.viewer,
       )
+      self.playback.set_rate(rate)
 
   def close_viewer(self):
     if self.viewer:
@@ -329,6 +363,8 @@ class MujocoRuntime:
         self.viewer.sync()
       time.sleep(0.01)
     self.wall_start += time.monotonic() - before
+    if self.paused or time.monotonic() - before > .005:
+      self.playback.reset(self.monotonic())
     self.step_requested = False
     if self.reset_requested:
       raise SimulationReset()
@@ -522,7 +558,9 @@ class MujocoRuntime:
     marker_p = state.root_pos - rotation(marker_q) @ np.asarray(
       cfg["root_marker_to_pelvis"]
     )
-    self.mocap.publish("root", marker_p, marker_q)
+    self.mocap.publish(
+      "root", marker_p + getattr(self, "world_translation", np.zeros(3)), marker_q
+    )
 
   def begin_landing(self):
     if self.support_active and self.landing_started is None:
@@ -600,11 +638,11 @@ class MujocoRuntime:
       if self.monotonic() + 1e-9 >= self.next_sensor:
         self.publish_root()
         if self.ball:
-          self.mocap.publish("ball", self.ball.position)
+          self.mocap.publish("ball", self.ball.position + self.world_translation)
         self.next_sensor += 0.01
       self.sample_lowstate()
     if self.render or self.ball_source == "mocap":
-      time.sleep(max(0, self.wall_start + self.monotonic() - time.monotonic()))
+      self.playback.wait(self.monotonic())
 
   def record(self, row):
     now = self.monotonic()
@@ -660,36 +698,62 @@ class MujocoRuntime:
         # of subsequent robot sway, falls, recovery or readiness metrics.
         self.feed_references = []
         self.fallback_feed_references = []
-        ball_cfg = self.cfg["ball"]
-        for index, reference in self.engine.candidates(self.robot.state()):
-          point = reference.strike_position(ball_cfg).copy()
-          # A below-table strike point rotated over the tabletop cannot be
-          # reached by any legal incoming flight. Serve just beyond the near
-          # edge instead, without waiting for the robot to turn/stand upright.
-          if point[2] <= ball_cfg["table_height"] + ball_cfg["ball_radius"]:
-            point[0] = min(
-              point[0], ball_cfg["table_near_x"] - ball_cfg["ball_radius"] - 0.03
+        if getattr(self.feeder, "independent_launch", False):
+          self.events.append(
+            dict(
+              time=now, event="independent_launch_region", region=self.options["feed"]
             )
-          point[1] = np.clip(
-            point[1],
-            -ball_cfg["table_width"] / 2 + 0.1,
-            ball_cfg["table_width"] / 2 - 0.1,
           )
-          fixed = SimpleNamespace(
-            strike_position=lambda cfg, point=point: point.copy(),
-            strike_time=reference.strike_time,
+        else:
+          ball_cfg = self.cfg["ball"]
+          control_state = copy.copy(self.robot.state())
+          translation = getattr(self, "world_translation", np.zeros(3))
+          if np.any(translation):
+            for name in ("root_pos", "anchor_pos", "racket_pos"):
+              setattr(control_state, name, getattr(control_state, name) + translation)
+          for index, reference in self.engine.candidates(control_state):
+            if np.any(translation):
+              # Convert reference geometry back for the physical feeder. Never
+              # change the controller's frozen home or motion transforms.
+              control_reference = reference
+              offset = translation.copy()
+              reference = SimpleNamespace(
+                source=getattr(control_reference, "source", control_reference),
+                rotation=getattr(control_reference, "rotation", np.eye(3)),
+                fps=control_reference.fps,
+                strike_position=lambda cfg, ref=control_reference, offset=offset: (
+                  ref.strike_position(cfg) - offset
+                ),
+                strike_time=control_reference.strike_time,
+              )
+            point = reference.strike_position(ball_cfg).copy()
+            # A below-table strike point rotated over the tabletop cannot be
+            # reached by any legal incoming flight. Serve just beyond the near
+            # edge instead, without waiting for the robot to turn/stand upright.
+            if point[2] <= ball_cfg["table_height"] + ball_cfg["ball_radius"]:
+              point[0] = min(
+                point[0], ball_cfg["table_near_x"] - ball_cfg["ball_radius"] - 0.03
+              )
+            point[1] = np.clip(
+              point[1],
+              -ball_cfg["table_width"] / 2 + 0.1,
+              ball_cfg["table_width"] / 2 - 0.1,
+            )
+            fixed = SimpleNamespace(
+              strike_position=lambda cfg, point=point: point.copy(),
+              strike_time=reference.strike_time,
+            )
+            self.feed_references.append((index, reference))
+            self.fallback_feed_references.append((index, fixed))
+          self.events.append(
+            dict(
+              time=now,
+              event="fixed_court_feed_region",
+              points=[
+                r.strike_position(ball_cfg).tolist() for _, r in self.feed_references
+              ],
+            )
           )
-          self.feed_references.append((index, reference))
-          self.fallback_feed_references.append((index, fixed))
-        self.events.append(
-          dict(
-            time=now,
-            event="fixed_court_feed_region",
-            points=[
-              r.strike_position(ball_cfg).tolist() for _, r in self.feed_references
-            ],
-          )
-        )
         self.first_feed_time = now + self.policy_wait
       if self.continuous_feed and self.next_serve is None:
         self.next_serve = max(now, self.first_feed_time)
@@ -701,7 +765,9 @@ class MujocoRuntime:
           try:
             incoming = self.feeder.sample(self.feed_references)
           except ValueError:
-            if not self.fallback_feed_references:
+            if not self.fallback_feed_references or getattr(
+              self.feeder, "requires_motion_geometry", False
+            ):
               raise
             incoming = self.feeder.sample(self.fallback_feed_references)
             self.feed_references = self.fallback_feed_references
@@ -722,6 +788,7 @@ class MujocoRuntime:
           incoming.feed_id = self.served
           incoming.previous_racket = self.robot.state().racket_pos.copy()
           self.ball = incoming
+          self.served_balls.append(incoming)
           self.balls.append(incoming)
           previous_estimate = self.mocap.ball.get(now)
           self.mocap.ball = BallEstimator(**self.mocap.cfg["estimator"])
@@ -757,6 +824,10 @@ class MujocoRuntime:
             np.array([1.0, 0.6, 0.1, 1.0]),
           )
           self.viewer.user_scn.ngeom += 1
+        if hasattr(self.feeder, "draw_grid"):
+          self.feeder.draw_grid(self.viewer.user_scn)
+      self.viewer.set_texts((None, None, "Playback\n[ / - slower\n] / + faster\n\\ normal",
+                             f"{self.playback.rate:g}x"))
       self.viewer.sync()
 
   def close(self):
@@ -793,7 +864,19 @@ def run_deployment(
   output=None,
   controller_factory=None,
   minimum_hit_rate=None,
+  minimum_return_rate=None,
+  feeder_factory=RandomBallFeeder,
 ):
+  if minimum_return_rate is not None and (
+    not np.isfinite(minimum_return_rate)
+    or not 0 <= minimum_return_rate <= 1
+    or ball_source != "sim"
+    or standing_only
+    or controls != "auto"
+  ):
+    raise ValueError(
+      "Minimum return rate requires automatic simulated-ball receiving and a value in [0, 1]"
+    )
   if minimum_hit_rate is not None and (
     not np.isfinite(minimum_hit_rate)
     or not 0 <= minimum_hit_rate <= 1
@@ -843,6 +926,7 @@ def run_deployment(
     final_hold=final_hold_seconds,
     startup=startup,
     ball_source=ball_source,
+    feeder_factory=feeder_factory,
   )
   if controller_factory is not None:
     session.metadata["shared_control_loop"] = "deploy.backends.unitree.run_control_loop"
@@ -875,6 +959,7 @@ def run_deployment(
         output=attempt_output,
         controller_factory=controller_factory,
         minimum_hit_rate=minimum_hit_rate,
+        minimum_return_rate=minimum_return_rate,
       )
       attempts.append(
         dict(
@@ -957,9 +1042,7 @@ def run_deployment(
                   ):
                     session.viewer.user_scn.geoms[index].pos[:] = ball.position
               session.viewer.sync()
-              time.sleep(
-                max(0, session.cfg["control_dt"] - (time.monotonic() - before))
-              )
+              session.playback.wait(session.monotonic(), frame_started=before)
           finally:
             if post_writer:
               post_writer.close()
@@ -997,6 +1080,7 @@ def _run_attempt(
   output,
   controller_factory=None,
   minimum_hit_rate=None,
+  minimum_return_rate=None,
 ):
   controls, standing_only, episodes, ball_source = (
     session.controls,
@@ -1070,12 +1154,20 @@ def _run_attempt(
     and (standing_only or controls == "manual" or session.engine.recovered >= episodes)
   )
   hit_rate = session.hits / session.served if session.served else 0.0
-  passed = flow_passed and (minimum_hit_rate is None or hit_rate >= minimum_hit_rate)
+  ball_returns = [ball.return_report() for ball in session.served_balls]
+  legal_returns = sum(ball["legal_return"] for ball in ball_returns)
+  return_rate = legal_returns / session.served if session.served else 0.0
+  passed = (
+    flow_passed
+    and (minimum_hit_rate is None or hit_rate >= minimum_hit_rate)
+    and (minimum_return_rate is None or return_rate >= minimum_return_rate)
+  )
   result.update(
     passed=bool(passed),
     flow_passed=bool(flow_passed),
     hit_rate=hit_rate,
     minimum_hit_rate=minimum_hit_rate,
+    minimum_return_rate=minimum_return_rate,
     robot_resets=1,
     reset_requested=session.reset_requested,
     actual_robot_commands_sent=False,
@@ -1084,6 +1176,9 @@ def _run_attempt(
     physics_validation=session.physics_validation,
     simulated_hits=session.hits,
     simulated_balls=session.served,
+    simulated_legal_returns=legal_returns,
+    legal_return_rate=return_rate,
+    ball_returns=ball_returns,
     error=error,
   )
   if summary_path:

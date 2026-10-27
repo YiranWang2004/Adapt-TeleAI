@@ -27,6 +27,7 @@ class UDPMocap:
       config["root_marker_to_pelvis"],
       config["root_stale_timeout"],
       config.get("root_marker_to_pelvis_quaternion_wxyz", (1.0, 0.0, 0.0, 0.0)),
+      conditioning=config.get("root_pose_filter"),
     )
     self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     self.socket.bind((config["udp"]["host"], config["udp"]["port"]))

@@ -17,6 +17,8 @@ from mjlab.asset_zoo.robots.unitree_g1_pingpong.g1_constants import (
   G1_PINGPONG_WRIST_BODY,
   get_g1_pingpong_robot_cfg,
 )
+from mjlab.envs import mdp as common
+from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.a3_pingpong.actions import FrozenTrackerActionCfg
 from mjlab.tasks.a3_pingpong.ball import ReceivingBallCommandCfg
@@ -40,6 +42,17 @@ STAGE2_TASK = "Mjlab-PingPong-Receive-G1-Stage2-Adaptive"
 TELE_GMR_STAGE2_TASK = "Mjlab-PingPong-Receive-G1-TeleGMR-Stage2-Adaptive"
 TELE_GMR_HARD_STAGE2_TASK = "Mjlab-PingPong-Receive-G1-TeleGMR-Hard-Stage2-Adaptive"
 TELE_GMR_TRACKER = "ckpts/g1_pingpong_tele_gmr/tracker.pt"
+
+# Extra waist-only penalty, added to the existing whole-body action_rate.
+# Stage1: raw tracker actions; Stage2: raw residuals, excluding the speed action.
+# Set either weight to 0.0 to disable that stage's extra penalty.
+WAIST_ACTION_RATE_WEIGHT_STAGE1 = -0.04
+WAIST_ACTION_RATE_WEIGHT_STAGE2 = -0.04
+WAIST_JOINT_NAMES = (
+  "waist_yaw_joint",
+  "waist_roll_joint",
+  "waist_pitch_joint",
+)
 
 
 def _sha256(path: Path) -> str:
@@ -128,6 +141,20 @@ def _specialize_robot(cfg, motion_files: tuple[str, ...] = MOTION_FILES):
   cfg.rewards["motion_hit_arm"].params.update(
     body_names=("right_elbow_link", "right_wrist_yaw_link"),
     strike_phase=0.46,
+  )
+  cfg.rewards["waist_action_rate"] = RewardTermCfg(
+    func=common.action_rate_l2,
+    weight=(
+      WAIST_ACTION_RATE_WEIGHT_STAGE2
+      if isinstance(action, FrozenTrackerActionCfg)
+      else WAIST_ACTION_RATE_WEIGHT_STAGE1
+    ),
+    params={
+      "action_name": "joint_pos",
+      "exclude_joint_names": tuple(
+        name for name in G1_PINGPONG_JOINT_NAMES if name not in WAIST_JOINT_NAMES
+      ),
+    },
   )
   cfg.terminations["feet_height"].params["body_names"] = G1_PINGPONG_FEET_BODIES
   cfg.viewer.body_name = G1_PINGPONG_ANCHOR_BODY

@@ -1,5 +1,16 @@
 # HOPEPingPongMultiMotionG1 部署
 
+独立随机目标指令评测使用新入口 `deploy.benchmarks.racket_command.run`，详见
+[随机 racket command 测试](../benchmarks/racket_command/README.md)。它按固定平面网格
+采样位置、朝向、速度与 TTS，范围由动作及训练随机化离线导出；采样器只读取域JSON，
+不从选中的 motion 反推目标。支持 MuJoCo 物理球接触/反弹展示与能力热力图。
+独立随机来球的第二阶段使用 `deploy.benchmarks.receive.run`，见
+[中心区域接球测试](../benchmarks/receive/README.md) 和
+[首批实际MuJoCo结果](../benchmarks/receive/RESULTS_20261021.md)。
+MuJoCo 连续部署使用本任务入口 `deploy.hope_g1.deploy_agent`，不调用上述评测环境。
+它保留手动进入策略的流程，运行中机器人状态、policy 历史和回位过程连续保留。
+旧配置 `rally_mujoco.yaml` 的 `motion_plane` 仅保留为历史回归，需显式指定。
+
 本任务使用独立入口 `deploy.hope_g1.deploy_agent` 和 `HopeController`，直接加载
 HOPE 的 `model_18000.pt`，不经过 mjlab Stage1 tracker 或 Stage2 actor。
 原任务继续使用 `deploy.g1_pingpong.deploy_agent` 和 `deploy/configs/`。
@@ -7,6 +18,51 @@ HOPE 的 `model_18000.pt`，不经过 mjlab Stage1 tracker 或 Stage2 actor。
 共享部分是 G1 资产、DDS/UDP、AMP、遥控器接管、保护、记录和 MuJoCo IO。
 任务配置全部位于本目录的 `configs/`；默认记录写入
 `deploy/recordings/hope_g1/<env>_<时间>/`，summary 明确记录 task、controller 和 checkpoint SHA256。
+
+默认使用 A30808 最新 ROS planner 核心 → RacketCommand → motion selector → actor，使用 raw 目标模式。
+此前物理配置下的本机三种子验收为 **30/30 碰拍、30/30 越网后首次落对方台面**；
+该历史结果不代表下述 2026-10-21 A3 参数统一后的表现。
+进入策略的流程保持原样；历史 A3 对齐证据见 [A3_ALIGNMENT_RESULT.md](A3_ALIGNMENT_RESULT.md)。
+
+## 当前 planner（A30808）
+
+部署直接调用 `hope_planner_optimized_2_A30808` 的原始 Stage 1/2/3 Python 核心和对应
+`configs/hope_planner_optimized_2.yaml` 参数，不启动独立 ROS planner 节点。动捕接收器
+把每一条球位置包（原始源时间戳、位置、接收时刻）交给该核心；它自行执行和 ROS 节点
+相同的滑窗拟合、轨迹预测及 racket command 求解。ROS topic 仅由部署进程内的输入队列替代。
+planner 命令 deadline 按 `接收时刻 + (t_strike - 源时间戳)` 映射到部署单调时钟。
+
+部署适配只覆盖击球平面：G1 使用 `x=-0.25 m`，发布框的 X min/max 同设为 `-0.25 m`；
+球桌、球坐标和目标落点不做平移或机器人专属重算。其余 Stage 1/2/3 参数来自
+`configs/hope_planner_optimized_2.yaml`。上游原始文件和适配记录见
+[`hope_planner_optimized_2/PROVENANCE.json`](hope_planner_optimized_2/PROVENANCE.json)。
+`a3_planner` 仅作为旧命令行/配置别名，运行时也会转到 A30808 核心。
+
+## 当前坐标与物理配置（2026-10-21）
+
+控制器、真实动捕、球预测、球拍目标均使用 **HOPE 桌面世界系**：近端左角为原点，
+桌面 X=[0,2.74]、Y=[-1.525,0]、Z=0；地面Z=-0.76。
+真实 `/P1/pose` 与 `/poses[0]` 已经是 P2 换边后的这个系，不再加0.76m。
+MuJoCo 物理模型仍保持地面Z=0，通过 `[-0.65,-0.7625,-0.76]` 的模拟动捕桥接
+进入 HOPE 系。球和根位置一起转换，速度、朝向和电机指令不变。
+馈球参考以逆变换进入物理模型；球桌可视化与物理碰撞仍处于同一 MuJoCo 系。
+
+- `configs/hope_planner_optimized_2.yaml`：A30808 ROS planner 的完整上游参数。
+- `configs/a3_planner.yaml`：历史 A3 launch 配置快照，仅用于对照。
+- `configs/rally.yaml`：真机入口，与正式连续 MuJoCo 对齐：击球平面X=-0.25，回球目标为对方半台中心。
+- `configs/rally_mujoco_random.yaml`：默认连续 MuJoCo 部署，全区域独立随机来球，回球目标为对方半台中心。
+- `configs/rally_mujoco.yaml`：历史 motion_plane 回归配置；不会作为默认部署配置。
+- `configs/rally_a3_reference.yaml`：保留的历史配置入口，planner 仍使用 A30808 参数。
+
+当前 A30808 planner 参数见 `configs/hope_planner_optimized_2.yaml`：目标落点、飞行时间、
+drag、桌面反弹系数、球拍恢复系数、积分步长及 Y/Z 发布范围均沿用 ROS planner 配置。
+G1 仅将 ROS 上游 x=0 击球平面及对应发布 X 框改为 `-0.25 m`。执行 motion 的启动
+TTS 上限仍由 `rally*.yaml` 中的 selector 配置控制（正式值0.5s），它不改 planner 预测。
+旧的现场标定记录仍保存在 [REAL_PHYSICS_CALIBRATION.json](REAL_PHYSICS_CALIBRATION.json)，
+其参数不再作为当前默认。`.200` HOPE 仓库仅只读，没有同步本地修改。
+planner 自己使用 A30808 Stage 1 的30点二次拟合窗口、10点启动阈值及其源码中的反弹/清窗规则；
+部署的 `BallEstimate` 保留给旧控制路径，不作为 A30808 的 planner 输入。球参数配置不改 actor 或 PD。
+训练物理下的30/30不代表真实球物理下的同等回球率，更不代表真机验收。
 
 ## 主机分工与迁移
 
@@ -16,11 +72,15 @@ HOPE 的 `model_18000.pt`，不经过 mjlab Stage1 tracker 或 Stage2 actor。
 本机已迁入 `artifacts/hope_20261012_18000/`：`model_18000.pt`、
 `params/env.yaml`、`params/agent.yaml`、22 个 NPZ 动作及 `hit_type.json`。
 `migration_manifest.json` 保存来源和逐文件 SHA256；26 个文件均已校验。
+另需 `robot/g1_29dof_pingpong_fast.urdf`（同目录 manifest 保存 SHA256），
+用于重建训练碰撞几何和开启自碰撞，不能漏同步。
 本机 AMP 和 G1 资产也已与 `.200` 核对一致。本机测试不依赖 SSH、`.200`、ROS 或 Isaac。
 大型资源位于已忽略的 `artifacts/` 目录，不纳入代码提交。
 
-配置按主机分开：`configs/task.yaml` 使用本机仓库内资源；
-`configs/task_real.yaml` 使用 `.200` 原训练目录。
+配置按主机分开：`configs/task.yaml`、`configs/task_real.yaml` 均使用部署仓库内相对路径。
+`.200` 的同步范围仅限 `/home/lxz/deploy_g1_pingpong`，
+不修改 `/home/lxz/HOPE`，部署也不再依赖该目录。
+2026-10-20 真机同步与操作步骤见 [REAL_DEPLOYMENT.md](REAL_DEPLOYMENT.md)。
 入口在 check/MuJoCo 时默认前者，real 时默认后者；也可显式传 `--config`。
 检查 `.200` 配置时应显式使用 `--config deploy/hope_g1/configs/task_real.yaml`。
 
@@ -40,13 +100,16 @@ cd /home/lhy/table-tennis/Adapt-TeleAI
 打开手动测试窗口：
 
 场景显示蓝色球桌、球网和白色边线；桌面、球网尺寸直接读取同一份
-`configs/rally.yaml` 的 ball 参数。默认视角同时覆盖机器人和球桌，
+所选 rally 配置的 ball 参数。默认视角同时覆盖机器人和球桌，
 可以在 `viewer` 配置中修改 lookat、distance、elevation、azimuth。
 
 ```zsh
 .venv/bin/python -m deploy.hope_g1.deploy_agent \
   --env mujoco --render --sim-controls manual \
-  --motion-index 0 --motion-select fixed --duration 600
+  --rally-config deploy/hope_g1/configs/rally_mujoco_random.yaml \
+  --motion-index 0 --motion-select auto --motion-allow all --duration 600 \
+  --seed 7 \
+  --output "deploy/recordings/hope_g1/continuous_$(date +%Y%m%d_%H%M%S)"
 ```
 
 在 MuJoCo 窗口依次操作（手动模式必须按 L 放下机器人）：
@@ -55,24 +118,56 @@ cd /home/lhy/table-tennis/Adapt-TeleAI
 2. **L**：1.5s 平滑降低支撑，等待终端显示 `support released`。
 3. **A**：切换 AMP，等待 `STABLE`。
 4. **W**：相当于真机方向键 UP，上身准备后进入 `TO_POLICY` 和 `WAIT_BALL`。
-5. **F**：单次发球，观察 `EXECUTE → RECOVER → WAIT_BALL`；
-   **T** 可切换连续发球，默认间隔 4s。
+5. 进入接球策略后**自动连续随机发球**，默认每 4s 一球，观察 `EXECUTE → RECOVER → WAIT_BALL`。
+   **T** 暂停/恢复连续发球（已经飞出的球继续运动）；**F** 额外发一球。
 6. **S** 返回 AMP；**B/X** 停控；**R** 重置；**Q** 退出。
    SPACE/P 暂停或继续，N 单步。
+
+所有 deploy MuJoCo 测试窗口使用相同的播放速度键：`[` 或 `-` 减半，
+`]` 或 `+` 加倍，反斜杠 `\` 恢复1倍。范围为1/16～8倍；先点击仿真窗口
+再按键，当前倍速显示在窗口/终端。变速只调整墙钟等待，不改物理步长、
+policy频率、TTS、传感器时间戳或发球间隔的仿真秒数。原来已开启的进程需重新启动。
+这也适用于独立command评测、接球评测及真机球轨迹驱动的人形测试。
 
 自动流程测试不需要按键；加 `--render` 可以观看同一自动流程：
 
 ```zsh
 .venv/bin/python -m deploy.hope_g1.deploy_agent \
   --env mujoco --motion-index 0 --motion-select auto \
-  --motion-allow all --episodes 10 --duration 70 --min-hit-rate 0.8
+  --target-source hope_planner_optimized_2 --a3-target-mode raw \
+  --sim-controls auto --motion-allow all --episodes 10 --duration 70
 ```
 
 `--standing-only` 可检查 AMP → HOPE 首帧保持，不发球。
-配置 `--min-hit-rate` 后，退出码 0 同时要求达到指定接触比例、完成回位且没有检测到失去站立。
-summary 分别记录 `flow_passed`、`hit_rate`、`simulated_hits`、`simulated_balls`；
-未配置命中率门槛时仍只验收流程。物理阈值沿用共享仿真的观察模式，真机保留停控保护。
-记录默认在 `deploy/recordings/hope_g1/mujoco_<时间>/`。
+配置 `--min-return-rate` 后，退出码 0 要求球先越网、首次落在对方台面，达到指定比例，
+同时完成回位且没有检测到失去站立。`--min-hit-rate` 只检查碰拍比例，不能替代有效回球验收。
+summary 分别记录 `flow_passed`、`hit_rate`、`legal_return_rate`、`simulated_legal_returns`，
+并在 `ball_returns` 中保存逐球碰撞前后速度、过网点、第一次桌面高度交点和出球轨迹。
+未配置比例门槛时只验收流程。历史 motion_plane 测试的成功率不能用于说明全区域随机来球能力。
+每次运行保存 `rally_config.yaml`，记录命令行覆盖后的实际配置。
+
+默认 `feed.mode=random_launch`，由 `deploy.hope_g1.random_feeder.RandomLaunchFeeder`
+独立采样初始球位置和速度，只根据过网、我方半台一次反弹以及穿过配置区域筛选来球。
+不读取 motion、planner 输出或策略击球结果，不反向重建轨迹。
+
+`configs/rally_mujoco_random.yaml` 中：
+
+- `feed.plane_x=-0.25`，`feed.y_range=[-1.51225,0.00200]`、
+  `feed.z_range=[-0.16225,0.71278]`（hope_table，桌面 Z=0）。
+  对应此前裁剪最低 Z 层后的完整包络，`feed.grid=[8,5]`，窗口按同一配置画无文字网格。
+  包络不是策略成功保证；其中也可能有训练支持较少或没有支持的位置。
+- 每批随机球覆盖全部 40 个网格，每格 `feed.balls_per_cell=3`，打乱顺序连续发送，
+  一批耗尽后重新随机生成；随机种子由 `--seed` 指定。
+- `feed.launch` 控制初始位置和速度范围；`feed.interval_seconds=4` 控制发球间隔，
+  调度不等待动作完成或回位，未接到的球不会自动重试。
+- `a3.hit_plane_x` 与发球平面一致；`ball.target_xy=[2.055,-0.7625]` 是对方半台中心，
+  只改变 planner 的任务目标，物理参数和 A3 计算方法不变。
+
+发球器、部署 IO 和控制器只共用通用采样/动力学代码，不导入 `deploy.benchmarks`。
+评测模块保留自己的配置、快照重置、计分和报表，仍使用单独入口。
+运行记录默认在 `deploy/recordings/hope_g1/mujoco_<时间>/`；
+`summary.json` 的 `ball_returns[].feed` 保存实际随机初始状态和所属网格。
+机器人不会逐球重置；仅操作者主动按 **R** 才重启整场部署。
 
 ## .200 真机测试
 
@@ -101,33 +196,8 @@ ros2 topic info /P1/pose
 ros2 topic echo /P1/pose --once --qos-reliability best_effort
 ```
 
-完整动捕链路需要以下三个常驻进程。仅在对应进程未运行时启动。
-
-终端 1：VRPN 客户端。
-
-```zsh
-source /opt/ros/humble/setup.zsh
-source /home/lxz/HOPE/hope_ws/install/setup.zsh
-export ROS_DOMAIN_ID=23 ROS_LOCALHOST_ONLY=0 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-cd /home/lxz/HOPE/hope_ws
-ros2 launch ./src/vrpn_mocap/vrpn_mocap/launch/client.launch.yaml \
-  server:=192.168.1.101 port:=3883 \
-  allowed_topics:="/vrpn_mocap/MCAvatar/pose4,/vrpn_mocap/MCAvatar/pose30310"
-```
-
-终端 2：转换器，将原始机器人/球数据发布为 `/P1/pose`、`/poses`。
-
-```zsh
-source /opt/ros/humble/setup.zsh
-source /home/lxz/HOPE/hope_ws/install/setup.zsh
-export ROS_DOMAIN_ID=23 ROS_LOCALHOST_ONLY=0 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-ros2 launch vrpn_to_pose vrpn_to_pose.launch.py \
-  robot_side:=P2 \
-  robot_input_topic:=/vrpn_mocap/MCAvatar/pose4 \
-  ball_input_topic:=/vrpn_mocap/MCAvatar/pose30310
-```
-
-终端 3：ROS→UDP 桥接。
+上游 VRPN/转换器由既有动捕系统提供，本任务不修改或管理 `.200` 的 HOPE 工作区。
+只确认已有 `/P1/pose`、`/poses` 输出。需要时在部署目录使用 ROS→UDP 桥接：
 
 ```zsh
 source /opt/ros/humble/setup.zsh
@@ -139,7 +209,7 @@ cd /home/lxz/deploy_g1_pingpong
 
 本任务的 `configs/mocap.yaml` 与已标定的 live 链路保持一致：
 `/P1/pose`（map）、`/poses`（world）→ `127.0.0.1:15050`。
-旧任务的 bridge 可以直接复用。
+旧 bridge 必须退出并使用本任务配置重启：归一化 UDP 帧现为 hope_table，旧 world 帧会被拒收。
 
 终端 4：先检查 `.200` 的策略配置：
 
@@ -164,7 +234,8 @@ cd /home/lxz/deploy_g1_pingpong
 ```zsh
 .venv/bin/python -m deploy.hope_g1.deploy_agent \
   --env real --network-interface eno1 \
-  --motion-index 0 --motion-select fixed \
+  --motion-index 0 --motion-select auto --motion-allow all \
+  --target-source hope_planner_optimized_2 --a3-target-mode raw --ball-source mocap \
   --duration 600 --enable-motors
 ```
 
@@ -181,13 +252,16 @@ cd /home/lxz/deploy_g1_pingpong
   `(obs - saved_mean) / (saved_std + 0.01)`；独立读取 actor，忽略 critic。
 - 顺序、默认姿态、默认关节速度、动作 scale、动作文件及回位 75 帧来自保存配置。
   执行 PD 沿用公共显式增益表；加载时核对其与训练 PD 一致，允许独立配置中的显式 scale。
-- 动捕位置差分估计机身世界线速度，再旋转到 pelvis 系；首次为零。
+- 动捕根位姿按配置做逐源样本 pose EMA / 跳变处理，按源时间戳差分、限速及速度 EMA，
+  使用与位置同一源样本的速度，再旋转到 pelvis 系；首次为零。
   这是真机状态估计，不等同于 Isaac 提供的无噪声速度。
 - 关节参考包含位置和速度；anchor 使用完整相对旋转；机身目标和拍面位置使用 yaw-heading 系，
   期望拍面速度/法向在物理世界中用于规划，送入 actor 前逆变换回训练 world；
-  击球后的剩余时间保留负值。整个动作库共享进入策略时固定的一个 world 变换。
-- 来球预测决定动作和接触点；期望拍面速度沿所选动作击球时的参考法向，
-  正反手符号按训练配置，速度为 3m/s。目标在开始挥拍时锁定，后续丢球不更换 actor。
+  击球后的剩余时间保留负值。按 A3 在切换挥拍动作时按当前 torso 做纯 yaw rebase，
+  等球/回位的 home 变换固定，不重置真实机器人状态。
+- A30808 planner 同时生成接触点、物理拍速、击球面法向及 deadline。
+  raw 模式中物理拍速不翻转；反手只翻转击球面法向，映射为本地 +Y。
+  目标在挥拍开始时锁定，后续丢球不换目标/actor；75 帧回位使用固定 home。
 - 部署采用固定 world home、等球时冻结首帧、挥拍后保持 home 1.5s 再接球。
   这是部署调度；训练中的随机换动作和目标扰动不会在部署时随机执行。
   raw actor action 连续保存，AMP 退出/重新进入时清零。
@@ -195,11 +269,19 @@ cd /home/lxz/deploy_g1_pingpong
 当前验证覆盖 CPU 推理、观测接口和 MuJoCo 接球。完整核对与修复记录见
 [TRAIN_PLAY_AUDIT.md](TRAIN_PLAY_AUDIT.md)。真机稳定性与击球效果需另行验收。
 
+对标前的问题记录见 [A3_DEPLOY_COMPARISON.md](A3_DEPLOY_COMPARISON.md)，
+完整修正和最新结果见 [A3_ALIGNMENT_RESULT.md](A3_ALIGNMENT_RESULT.md)。
+`--target-source reference` 仅用于明确的旧参考目标基线；`--a3-target-mode envelope`
+选择 A3 的包络模式。默认 raw 与两者分开记录，不自动回退或补偿动作。
+
 ## 2026-10-19 验证记录
 
 以下较早记录的 0 次接触已复现并修复：参考 world/绝对向量、动作库变换和机身目标耦合
 完成修正后，三个种子合计 30/30 次模拟碰撞命中；名义跟踪组合阈值为 22/22 通过。
-后续接球验收使用上面的命中率门槛，详细证据见核对报告。
+这些接触数据不表示有效回球。新增按参考击球平面发球并要求来球过网后一次落台的测试：
+seed=42、7、123 各 10 球，合计碰拍 30/30，有效回球 0/30，覆盖 16 个参考动作，
+均完成挥拍回位且未检测到失去站立。当前策略在该来球分布下不能稳定有效回球。
+原球物理、PD、checkpoint 和训练目标构造均未为这项测试修改；详细证据见核对报告。
 
 - 持久迁移后在本机重新测试：默认配置直接加载仓库内 checkpoint 和动作，
   自动选中动作 8、17、13，三次挥拍/回位全部完成；最大倾角 12.62°，
@@ -219,3 +301,15 @@ cd /home/lxz/deploy_g1_pingpong
 - 目标机记录：`deploy/recordings/hope_g1/validation_20261019_auto/`，
   包含 `summary.json`、`trace.jsonl` 和 `policy_parity.json`。
 - 验证没有启动真机电机输出，也没有改动原训练目录或 checkpoint。
+
+## 真机日志回看
+
+独立的 MuJoCo 回看工具可读取已有真机日志目录，显示实测机器人姿态、球观测与 racket command，支持变速、暂停、逐帧和时间跳转：
+
+```bash
+.venv/bin/python -m deploy.tools.view_real_log \
+  --recording deploy/recordings/hope_g1/real_20261022_121714
+```
+
+完整参数、按键和还原范围见 [真机日志回看说明](../tools/REAL_LOG_VIEWER.md)。
+

@@ -1,3 +1,5 @@
-# .200 real-robot host: keep the original training checkpoint and motion paths.
+# .200 deployment must be self-contained under deploy_g1_pingpong.
+# Sync the same migrated assets used locally; do not depend on /home/lxz/HOPE.
 task: HOPEPingPongMultiMotionG1
-checkpoint: /home/lxz/HOPE/hope_training/whole_body_tracking/logs/rsl_rl/g1_hope_multi_motion/2026-10-12_14-47-27_g1_hope_multi_motion--4096env--self_collision/model_18000.pt
+checkpoint: deploy/hope_g1/artifacts/hope_20261012_18000/model_18000.pt
+motion_dir: deploy/hope_g1/artifacts/hope_20261012_18000/motions

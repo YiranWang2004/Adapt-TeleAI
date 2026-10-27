@@ -51,8 +51,7 @@ def input_packet(msg, kind, cfg):
   # Per-input frame labels do not imply a TF transform. Both inputs must still
   # share the coordinates expected by the configured common transform.
   expected = (
-    source.get(f"{kind}_frame", source["frame"])
-    if source else cfg["world_frame"]
+    source.get(f"{kind}_frame", source["frame"]) if source else cfg["world_frame"]
   )
   if msg.header.frame_id != expected:
     raise ValueError(f"Expected source frame {expected}, got {msg.header.frame_id}")
@@ -158,6 +157,7 @@ class RosMocap:
       config["root_marker_to_pelvis"],
       config["root_stale_timeout"],
       config.get("root_marker_to_pelvis_quaternion_wxyz", (1.0, 0.0, 0.0, 0.0)),
+      conditioning=config.get("root_pose_filter"),
     )
 
     def consume(packet):
