@@ -11,7 +11,7 @@ target_source: hope_planner_optimized_2
 a3:
   target_mode: raw
   reference_mode: a3_live
-  hit_plane_x: -0.25
+  hit_plane_x: 0.0
   flight_seconds: 0.5
   max_command_time_to_strike: 0.5
   command_timeout_seconds: 0.2

@@ -134,3 +134,16 @@ Outputs include `planner_errors.png`, `trajectory_comparison.png`, full numerica
 results, initial conditions, and the 1 ms physical trajectories. The later portion
 of the real recordings includes unexplained deflections near the robot; those
 deflections are deliberately absent from this free-flight planner experiment.
+
+The 1026 input, `recorded_ball_cases_20261026.json`, contains two incoming
+trajectories: 154 samples from `real_20261026_201506` and 190 samples from
+`real_20261026_202459` (344 total). Use `--recording` to select this file.
+The second recording's `world` frame label is normalized to `hope_table` without
+changing XYZ: both runs have identity mocap transforms, consistent home anchors,
+and a table-height bounce. This is a consistency check, not a fresh calibration;
+the evidence and original config are retained in the case metadata.
+Reproduce the second extraction with
+`.venv/bin/python -m deploy.benchmarks.planner.extract_1026_second` after placing
+its original `mocap_packets.jsonl` and `summary.json` in
+`deploy/recordings/real_20261026_202459/`. The incoming segment begins at the last
+launch X turning point before selection and ends at its first X=-0.25m crossing.

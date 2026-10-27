@@ -11,7 +11,7 @@ a3:
   # Matches README-TeleAI's --no-target-clamp --fixed-world-home --no-return-blend.
   target_mode: raw
   reference_mode: a3_live
-  hit_plane_x: -0.25
+  hit_plane_x: 0.0
   flight_seconds: 0.5
   max_command_time_to_strike: 0.5
   command_timeout_seconds: 0.2
